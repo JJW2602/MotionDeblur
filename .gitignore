@@ -1,0 +1,22 @@
+# Dataset (large image files)
+dataset/gopro/blur/
+dataset/gopro/sharp/
+
+# Results & outputs
+results/
+
+# Wandb
+wandb/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
