@@ -169,6 +169,8 @@ class Workspace:
             num_inference_steps=self.cfg.steps,
             guidance_scale=self.cfg.guidance_scale,
             generator=generator,
+            width=self.cfg.width1,
+            height=self.cfg.height1,
         ).images[0]
         return result
 
@@ -359,6 +361,7 @@ class Workspace:
 
         # ── Dataset & DataLoader ────────────────────────────────────
         dataset = self._build_dataset("train")
+        val_dataset = self._build_dataset("test")
         def pil_collate(batch):
             """Keep PIL images as lists instead of stacking into tensors."""
             return {k: [d[k] for d in batch] for k in batch[0]}
@@ -369,6 +372,14 @@ class Workspace:
             shuffle=True,
             num_workers=train_cfg.data.num_workers,
             drop_last=True,
+            collate_fn=pil_collate,
+        )
+        val_dataloader = DataLoader(
+            val_dataset,
+            batch_size=1,
+            shuffle=False,
+            num_workers=train_cfg.data.num_workers,
+            drop_last=False,
             collate_fn=pil_collate,
         )
 
@@ -382,6 +393,7 @@ class Workspace:
             import wandb
             wandb.init(
                 project=self.cfg.wandb_project,
+                entity=self.cfg.get("wandb_entity", None),
                 config={
                     "tuning_architecture": arch,
                     "max_train_steps": train_cfg.max_train_steps,
@@ -401,7 +413,143 @@ class Workspace:
         max_steps = train_cfg.max_train_steps
         num_epochs = max(1, max_steps // len(dataset) + 1)
 
-        print(f"[train] arch={arch}  dataset={len(dataset)}  "
+        # ── Smoothed loss trackers ─────────────────────────────────
+        ema_loss = 0.0
+        ema_loss_unweighted = 0.0
+        ema_decay = 0.99
+        # Timestep-binned running averages (low/mid/high thirds)
+        bin_edges = [0, num_train_timesteps // 3, 2 * num_train_timesteps // 3, num_train_timesteps]
+        bin_names = ["low_t", "mid_t", "high_t"]
+        bin_loss_sum = [0.0, 0.0, 0.0]
+        bin_loss_count = [0, 0, 0]
+        # Window average
+        from collections import deque
+        loss_window = deque(maxlen=100)
+
+        # ── Validation helper ───────────────────────────────────────
+        val_generator = torch.Generator(device=self.device).manual_seed(self.cfg.seed)
+
+        def run_validation(val_dl, val_gen):
+            """Compute average loss over the full validation set."""
+            was_training = pipe.transformer.training
+            pipe.transformer.eval()
+            if controlnet is not None:
+                controlnet.eval()
+
+            val_loss_sum = 0.0
+            val_count = 0
+            # Per-bin validation loss
+            val_bin_sum = [0.0, 0.0, 0.0]
+            val_bin_count = [0, 0, 0]
+
+            with torch.no_grad():
+                for val_batch in val_dl:
+                    val_sharp = val_batch["sharp"][0]
+                    val_target_latents = self._encode_image_tensor(pipe, val_sharp)
+
+                    if train_cfg.train_text_encoders:
+                        ve, vp = cached_prompt_embeds, cached_pooled_prompt_embeds
+                    else:
+                        ve, vp = cached_prompt_embeds, cached_pooled_prompt_embeds
+
+                    val_noise = torch.randn(
+                        val_target_latents.shape, generator=val_gen,
+                        device=self.device, dtype=self.dtype,
+                    )
+                    val_u = compute_density_for_timestep_sampling(
+                        weighting_scheme=train_cfg.weighting_scheme,
+                        batch_size=1, device=self.device, generator=val_gen,
+                    )
+                    val_indices = (val_u * num_train_timesteps).long().clamp(max=num_train_timesteps - 1).cpu()
+                    val_ts = scheduler.timesteps[val_indices].to(device=self.device)
+                    val_sigmas = scheduler.sigmas[val_indices].to(device=self.device, dtype=self.dtype)
+                    val_noisy = scheduler.scale_noise(val_target_latents, val_ts, val_noise)
+                    val_target = val_noise - val_target_latents
+
+                    if arch == "controlnetSD3":
+                        val_canny = val_batch["canny"][0]
+                        val_canny_t = pipe.image_processor.preprocess(val_canny).to(
+                            device=self.device, dtype=self.dtype,
+                        )
+                        val_cn_out = controlnet(
+                            hidden_states=val_noisy, timestep=val_ts,
+                            encoder_hidden_states=ve, pooled_projections=vp,
+                            controlnet_cond=val_canny_t, return_dict=False,
+                        )
+                        val_pred = pipe.transformer(
+                            hidden_states=val_noisy, timestep=val_ts,
+                            encoder_hidden_states=ve, pooled_projections=vp,
+                            block_controlnet_hidden_states=val_cn_out[0],
+                            return_dict=False,
+                        )[0]
+                    else:
+                        val_pred = pipe.transformer(
+                            hidden_states=val_noisy, timestep=val_ts,
+                            encoder_hidden_states=ve, pooled_projections=vp,
+                            return_dict=False,
+                        )[0]
+
+                    sample_loss = (val_pred.float() - val_target.float()).pow(2).mean().item()
+                    val_loss_sum += sample_loss
+                    val_count += 1
+
+                    vt = val_ts[0].item()
+                    for bi in range(3):
+                        if bin_edges[bi] <= vt < bin_edges[bi + 1]:
+                            val_bin_sum[bi] += sample_loss
+                            val_bin_count[bi] += 1
+                            break
+
+            # Restore training mode
+            if was_training:
+                pipe.transformer.train()
+            if controlnet is not None and arch == "controlnetSD3":
+                controlnet.train()
+
+            avg_loss = val_loss_sum / max(val_count, 1)
+            bin_avgs = {}
+            for bi, bname in enumerate(bin_names):
+                if val_bin_count[bi] > 0:
+                    bin_avgs[bname] = val_bin_sum[bi] / val_bin_count[bi]
+            return avg_loss, bin_avgs
+
+        # ── Checkpoint save helper ─────────────────────────────────
+        def save_checkpoint(step_label):
+            output_dir = Path(train_cfg.output_dir)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            # Replace .safetensors with _step{label}.safetensors
+            base_name = train_cfg.weight_name.replace(".safetensors", "")
+            ckpt_name = f"{base_name}_step{step_label}.safetensors"
+
+            if arch == "controlnetSD3":
+                controlnet_lora_layers = convert_state_dict_to_diffusers(
+                    controlnet.get_adapter_state_dict()
+                )
+                from safetensors.torch import save_file
+                save_file(controlnet_lora_layers, str(output_dir / ckpt_name))
+            else:
+                transformer_lora_layers = convert_state_dict_to_diffusers(
+                    pipe.transformer.get_adapter_state_dict()
+                )
+                text_encoder_lora_layers = None
+                text_encoder_2_lora_layers = None
+                if train_cfg.train_text_encoders:
+                    text_encoder_lora_layers = convert_state_dict_to_diffusers(
+                        get_peft_model_state_dict(pipe.text_encoder)
+                    )
+                    text_encoder_2_lora_layers = convert_state_dict_to_diffusers(
+                        get_peft_model_state_dict(pipe.text_encoder_2)
+                    )
+                pipe.save_lora_weights(
+                    save_directory=str(output_dir),
+                    transformer_lora_layers=transformer_lora_layers,
+                    text_encoder_lora_layers=text_encoder_lora_layers,
+                    text_encoder_2_lora_layers=text_encoder_2_lora_layers,
+                    weight_name=ckpt_name,
+                )
+            print(f"[ckpt] Saved -> {output_dir / ckpt_name}")
+
+        print(f"[train] arch={arch}  dataset={len(dataset)}  val={len(val_dataset)}  "
               f"max_steps={max_steps}  epochs≈{num_epochs}")
 
         pbar = tqdm(total=max_steps, desc=f"[train] {arch}", unit="step")
@@ -487,28 +635,82 @@ class Workspace:
 
                 # ── Logging ────────────────────────────────────────
                 loss_val = loss.item()
+                loss_unweighted = (model_pred.float() - target.float()).pow(2).mean().item()
+
+                # EMA smoothing
+                if global_step == 1:
+                    ema_loss = loss_val
+                    ema_loss_unweighted = loss_unweighted
+                else:
+                    ema_loss = ema_decay * ema_loss + (1 - ema_decay) * loss_val
+                    ema_loss_unweighted = ema_decay * ema_loss_unweighted + (1 - ema_decay) * loss_unweighted
+
+                # Window average
+                loss_window.append(loss_val)
+                window_avg = sum(loss_window) / len(loss_window)
+
+                # Timestep bin accumulation
+                t_val = timesteps[0].item()
+                for bi in range(3):
+                    if bin_edges[bi] <= t_val < bin_edges[bi + 1]:
+                        bin_loss_sum[bi] += loss_unweighted
+                        bin_loss_count[bi] += 1
+                        break
+
                 pbar.update(1)
-                pbar.set_postfix(epoch=epoch, loss=f"{loss_val:.6f}")
+                pbar.set_postfix(epoch=epoch, loss=f"{loss_val:.6f}", ema=f"{ema_loss:.6f}")
 
                 if use_wandb:
                     log_dict = {
-                        # loss
-                        "train/loss": loss_val,
-                        "train/loss_unweighted": (model_pred.float() - target.float()).pow(2).mean().item(),
-                        # schedule
-                        "train/epoch": epoch,
-                        "train/timestep": timesteps[0].item(),
-                        "train/sigma": sigmas[0].item(),
-                        "train/snr": (1.0 / sigmas[0].item() ** 2) if sigmas[0].item() > 0 else 0.0,
-                        # optimizer
-                        "train/lr": optimizer.param_groups[0]["lr"],
-                        "train/grad_norm": grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm,
+                        # Raw loss (per-step, noisy)
+                        "loss/raw": loss_val,
+                        "loss/raw_unweighted": loss_unweighted,
+                        # Smoothed loss (학습 추이 확인용 — 이것을 보세요)
+                        "loss/ema": ema_loss,
+                        "loss/ema_unweighted": ema_loss_unweighted,
+                        "loss/window_avg_100": window_avg,
+                        # Schedule info
+                        "schedule/epoch": epoch,
+                        "schedule/timestep": t_val,
+                        "schedule/sigma": sigmas[0].item(),
+                        # Optimizer
+                        "optim/lr": optimizer.param_groups[0]["lr"],
+                        "optim/grad_norm": grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm,
                     }
-                    # GPU memory (logged every log_every steps)
+
+                    # Timestep-binned loss (log every log_every steps)
+                    if global_step % train_cfg.log_every == 0:
+                        for bi, bname in enumerate(bin_names):
+                            if bin_loss_count[bi] > 0:
+                                log_dict[f"loss_by_t/{bname}_avg"] = bin_loss_sum[bi] / bin_loss_count[bi]
+                                log_dict[f"loss_by_t/{bname}_count"] = bin_loss_count[bi]
+                        # Reset bins after logging
+                        bin_loss_sum = [0.0, 0.0, 0.0]
+                        bin_loss_count = [0, 0, 0]
+
+                    # GPU memory
                     if torch.cuda.is_available() and (global_step == 1 or global_step % train_cfg.log_every == 0):
                         log_dict["system/gpu_mem_allocated_gb"] = torch.cuda.memory_allocated() / 1e9
                         log_dict["system/gpu_mem_reserved_gb"] = torch.cuda.memory_reserved() / 1e9
+
                     wandb.log(log_dict, step=global_step)
+
+                # ── Periodic checkpoint ───────────────────────────
+                if global_step % train_cfg.save_every == 0:
+                    save_checkpoint(global_step)
+
+            # ── Epoch-end validation ───────────────────────────
+            if use_wandb and global_step > 0:
+                print(f"[val] Running validation after epoch {epoch} (step {global_step})...")
+                val_avg_loss, val_bin_avgs = run_validation(val_dataloader, val_generator)
+                val_log = {
+                    "val/loss": val_avg_loss,
+                    "val/epoch": epoch,
+                }
+                for bname, bavg in val_bin_avgs.items():
+                    val_log[f"val_by_t/{bname}_avg"] = bavg
+                wandb.log(val_log, step=global_step)
+                print(f"[val] epoch={epoch}  val_loss={val_avg_loss:.6f}")
 
             if global_step >= max_steps:
                 break
@@ -517,38 +719,8 @@ class Workspace:
         if use_wandb:
             wandb.finish()
 
-        # ── Save LoRA weights ───────────────────────────────────────
-        output_dir = Path(train_cfg.output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        if arch == "controlnetSD3":
-            controlnet_lora_layers = convert_state_dict_to_diffusers(
-                controlnet.get_adapter_state_dict()
-            )
-            from safetensors.torch import save_file
-            save_file(controlnet_lora_layers, str(output_dir / train_cfg.weight_name))
-            print(f"Saved ControlNet LoRA weights -> {output_dir / train_cfg.weight_name}")
-        else:
-            transformer_lora_layers = convert_state_dict_to_diffusers(
-                pipe.transformer.get_adapter_state_dict()
-            )
-            text_encoder_lora_layers = None
-            text_encoder_2_lora_layers = None
-            if train_cfg.train_text_encoders:
-                text_encoder_lora_layers = convert_state_dict_to_diffusers(
-                    get_peft_model_state_dict(pipe.text_encoder)
-                )
-                text_encoder_2_lora_layers = convert_state_dict_to_diffusers(
-                    get_peft_model_state_dict(pipe.text_encoder_2)
-                )
-            pipe.save_lora_weights(
-                save_directory=str(output_dir),
-                transformer_lora_layers=transformer_lora_layers,
-                text_encoder_lora_layers=text_encoder_lora_layers,
-                text_encoder_2_lora_layers=text_encoder_2_lora_layers,
-                weight_name=train_cfg.weight_name,
-            )
-            print(f"Saved SD3 LoRA weights -> {output_dir / train_cfg.weight_name}")
+        # ── Save final weights ─────────────────────────────────────
+        save_checkpoint("final")
 
 
 @hydra.main(version_base=None, config_path=".", config_name="run")

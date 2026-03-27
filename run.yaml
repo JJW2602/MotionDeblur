@@ -10,8 +10,8 @@ prompt: "a sharp, clean, natural photo, no motion blur, high detail"
 negative_prompt: "motion blur, blurry, ghosting, smear, low quality, artifacts"
 
   # Model Hyperparameters
-height1: 1024
-width1: 1024
+height1: 720
+width1: 1280
 sigmas: None
 strength: 0.45 # SDE strength Bigger -> Pure Noise
 guidance_scale: 6.0 #default 7
@@ -39,7 +39,8 @@ train:
   tuning_architecture: SD3  # "SD3" or "controlnetSD3"
   output_dir: ./results/lora/sd3_img2img
   weight_name: sd3_lora.safetensors
-  max_train_steps: 5000
+  max_train_steps: 10000
+  save_every: 2000
   learning_rate: 1.0e-4
   weight_decay: 0.0
   max_grad_norm: 1.0
