@@ -1,0 +1,46 @@
+# Baseline eval: Restormer (Stage1) + SD3.5 Large Blur ControlNet (Stage2).
+# Run from /scratch2/james2602/playground/Motionblur:
+#   python -m eval.restormer_sd35_eval
+# Smoke test on first 5 images:
+#   python -m eval.restormer_sd35_eval ++smoke=true
+
+defaults:
+  - _self_
+
+# All paths are resolved relative to the project root (cwd from which you run).
+# Hydra changes cwd by default — disable that so the relative paths below stay valid.
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  job:
+    chdir: false
+
+data:
+  blur_dir: dataset/gopro/blur/images
+  sharp_dir: dataset/gopro/sharp/images
+  split_file: dataset/gopro/split.json
+  split: test
+  resolution: 1024  # min-side target before snap-to-multiple-of-64
+
+restormer:
+  ckpt: prior_aware/stage1/Restormer/Motion_Deblurring/pretrained_models/motion_deblurring.pth
+
+sd35:
+  base: stabilityai/stable-diffusion-3.5-large
+  controlnet: stabilityai/stable-diffusion-3.5-large-controlnet-blur
+  prompt: "a sharp, clean, deblurred photo, high detail, no motion blur"
+  negative_prompt: "blurry, motion blur, ghosting, smear, low quality, artifacts"
+  num_inference_steps: 40
+  guidance_scale: 4.0
+  controlnet_conditioning_scale: 0.8
+  seed: 0
+
+eval:
+  run_a: true            # control_image = Restormer output (DiffBIR-style)
+  run_b: true            # control_image = raw blur (ablation)
+  crop_border: 0
+  output_dir: results/baseline_restormer_sd35
+  save_images: true
+
+smoke: false             # set ++smoke=true on the CLI to limit to 5 images

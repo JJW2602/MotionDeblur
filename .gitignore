@@ -1,0 +1,44 @@
+# ===== Data & outputs =====
+dataset/
+results/
+wandb/
+outputs/
+*.log
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# ===== Model weights =====
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.bin
+
+# ===== External git checkouts (have their own .git, add as submodules later if needed) =====
+# Upstreams:
+#   DiffBIR                              https://github.com/XPixelGroup/DiffBIR.git
+#   flow_grpo                            (internal/unknown)
+#   etc/prior_aware/stage1/FFTformer     https://github.com/kkkls/FFTformer.git
+#   etc/prior_aware/stage1/Restormer     https://github.com/swz30/Restormer.git
+DiffBIR/
+flow_grpo/
+etc/prior_aware/stage1/FFTformer/
+etc/prior_aware/stage1/Restormer/
+
+# ===== Per-workspace experiment outputs =====
+SDEdit/result/
+ControlNet/result/
+OURS/result/
+etc/results/
+
+# ===== Editor / OS =====
+.vscode/
+.idea/
+.DS_Store
+*.swp

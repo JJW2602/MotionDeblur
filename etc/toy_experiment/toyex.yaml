@@ -1,0 +1,57 @@
+# Image configuration
+num_images: 100
+blured_img_dir: "/scratch2/james2602/playground/Motionblur/Motionblur/dataset/gopro/blur/images"
+sharp_img_dir: "/scratch2/james2602/playground/Motionblur/Motionblur/dataset/gopro/sharp/images"
+csv_dir: "/scratch2/james2602/playground/Motionblur/Motionblur/toy_experiment/csv_results"
+frequency_methods:
+  - gaussian
+  - box
+  - median
+  - laplacian
+  - fft
+gaussian_sigma: 1.5
+box_kernel_size: 5
+median_kernel_size: 5
+fft_cutoff_ratio: 0.1
+
+
+# Data
+input: /scratch2/james2602/playground/Motionblur/Motionblur/dataset/gopro/blur/images/000001.png
+output: ./results/img2img/v
+save_grid: true
+grid_output: null
+
+# Wandb
+use_wandb: false
+wandb_project: url_benchmark
+
+# Others
+device: null
+
+train:
+  output_dir: ./results/lora/sd3_img2img
+  weight_name: sd3_img2img_lora.safetensors
+  max_train_steps: 200
+  batch_size: 1
+  learning_rate: 1.0e-4
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  gradient_checkpointing: true
+  train_text_encoders: false
+  rank: 8
+  alpha: 8
+  text_encoder_rank: 4
+  text_encoder_alpha: 4
+  dropout: 0.0
+  weighting_scheme: none
+  log_every: 10
+  target_modules:
+    - to_q
+    - to_k
+    - to_v
+    - to_out.0
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null

@@ -1,0 +1,68 @@
+# ControlNet workspace — SD3.5 + selectable ControlNet
+mode: inference            # train | test | inference
+name: baseline_blur_cn     # experiment name → result/<name>/<mode>/
+
+# Model
+base_model: stabilityai/stable-diffusion-3.5-large
+controlnet_model: stabilityai/stable-diffusion-3.5-large-controlnet-blur
+control_source: blur       # "blur" | "canny"
+cpu_offload: true
+
+# Prompt
+prompt: "a sharp, clean, natural photo, no motion blur, high detail"
+negative_prompt: "motion blur, blurry, ghosting, smear, low quality, artifacts"
+
+# Generation
+guidance_scale: 6.0
+controlnet_scale: 0.8
+steps: 40
+seed: 42
+canny_low: 100
+canny_high: 200
+
+# Inference single image
+input: /scratch2/james2602/playground/Motionblur/dataset/gopro/blur/images/000007.png
+
+# LoRA checkpoint (null = no LoRA)
+checkpoint: null
+
+# Test
+test:
+  save_images: false
+
+# Train  (LoRA on ControlNet; transformer + text encoders frozen)
+train:
+  max_train_steps: 10000
+  save_every: 2000
+  val_every: 500
+  learning_rate: 1.0e-4
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  gradient_checkpointing: true
+  rank: 8
+  alpha: 8
+  dropout: 0.0
+  weighting_scheme: none
+  target_modules:
+    - to_q
+    - to_k
+    - to_v
+    - to_out.0
+
+# Data (shared train + test)
+data:
+  blur_dir: /scratch2/james2602/playground/Motionblur/dataset/gopro/blur/images
+  sharp_dir: /scratch2/james2602/playground/Motionblur/dataset/gopro/sharp/images
+  split_file: /scratch2/james2602/playground/Motionblur/dataset/gopro/split.json
+  resolution: 512
+  num_workers: 4
+
+# Wandb
+use_wandb: false
+wandb_entity: MotionBlur
+wandb_project: ControlNet_LoRA
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
