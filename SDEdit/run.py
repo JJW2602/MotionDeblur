@@ -178,10 +178,13 @@ class Workspace:
     # -- generation ---------------------------------------------------------
     def _img2img(self, pipe, image: Image.Image, strength: float, guidance: float, steps: int, seed: int) -> Image.Image:
         g = torch.Generator(device=self.device).manual_seed(seed)
+        w, h = image.size
         return pipe(
             prompt=self.cfg.prompt,
             negative_prompt=self.cfg.negative_prompt,
             image=image,
+            height=h,
+            width=w,
             strength=float(strength),
             num_inference_steps=int(steps),
             guidance_scale=float(guidance),

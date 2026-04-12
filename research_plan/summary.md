@@ -1,7 +1,7 @@
 # Project: Motionblur
 
 **Path**: `/scratch2/james2602/playground/Motionblur`  
-**Last updated**: 2026-04-11
+**Last updated**: 2026-04-13
 
 ---
 
@@ -67,7 +67,10 @@ Motionblur/
 - **LoRA**: rank=8, alpha=8, target_modules=`[to_q, to_k, to_v, to_out.0]`
 - **SDEdit**: transformer LoRA, sharp 이미지에 SD3 flow-match objective (blur 미참여, 분포 편향 기대)
 - **ControlNet**: ControlNet LoRA. `control_source ∈ {blur, canny}` 로 control image 생성
-- **OURS**: ControlNet LoRA only (Restormer 는 frozen). Control = Restormer(blur). Restormer arch 은 `etc/prior_aware/.../restormer_arch.py` 를 importlib 로 standalone 로드
+- **OURS** (2026-04-13 재구현): DiffBIR-style 2-stage pipeline.
+  - Stage1: Restormer subprocess (`demo.py`), precompute 지원
+  - Stage2: SD3.5 ControlNet + **ConcatProjection** (`Conv2d(32→16, 1x1)`, identity init). `cat(noisy_z, prior_latent)` → projection → ControlNet `hidden_states` (concat path) + `controlnet_cond=prior_latent` (additive path) → 이중 conditioning. Transformer는 원본 z만 받음.
+  - Train: ControlNet LoRA + ConcatProjection (full params, 별도 lr). Restormer + Transformer frozen.
 
 ---
 
@@ -82,8 +85,10 @@ Motionblur/
 | `SDEdit/script/parameter_tuning_test.slurm` | Test 3-D sweep, 각 task 가 1 combo × 100장 test split |
 | `ControlNet/run.py` | SD3.5 + selectable ControlNet (blur / canny) |
 | `ControlNet/run.yaml` | ControlNet Hydra config |
-| `OURS/run.py` | Restormer Stage1 + SD3.5 ControlNet Stage2 (LoRA on ControlNet only) |
-| `OURS/run.yaml` | OURS Hydra config |
+| `OURS/run.py` | DiffBIR-style Stage1(Restormer subprocess) + Stage2(SD3.5 ControlNet + ConcatProjection). Custom denoising loop |
+| `OURS/run.yaml` | OURS Hydra config (stage1/stage2 nested 구조) |
+| `OURS/script/tuning_inference_test.slurm` | 15 jobs 1-D sweep (controlnet_scale × guidance_scale × steps) |
+| `OURS/script/finetune_lora.slurm` | 5 jobs LoRA config sweep (rank × target_modules × lr) |
 
 ### Legacy / 참조용 (`etc/`)
 | 파일 | 설명 |
@@ -137,5 +142,6 @@ Motionblur/
 
 - **DiffBIR 기반 2-stage pipeline**: 구현 완료 (SwinIR + ControlNet), 2026-03~04 wandb 로그 참조
 - **2026-04-07**: Restormer + SD3.5 Large Blur ControlNet fine-tuning-free baseline 평가 스크립트 (`etc/eval/restormer_sd35_eval.py`) 구축
-- **2026-04-11 (NEW)**: 프로젝트 구조 전면 재편 → 3-workspace (SDEdit / ControlNet / OURS). SDEdit parameter sweep SLURM 2종 준비 완료. `gopro_deblur.zip` 압축 해제 완료. **SLURM 실제 제출은 아직** — HF_TOKEN, Restormer ckpt, `mkdir -p result/_logs` 가 선행 필요
-- **알려진 wire-up 이슈**: `SDEdit/run.yaml` 의 `test.num_images` 필드가 아직 `run.py` 에 반영 안 됨 (smoke flag 만 사용 중)
+- **2026-04-11**: 프로젝트 구조 전면 재편 → 3-workspace (SDEdit / ControlNet / OURS). SDEdit parameter sweep SLURM 2종 준비 완료. `gopro_deblur.zip` 압축 해제 완료.
+- **2026-04-13 (NEW)**: OURS workspace 전면 재구현 — DiffBIR-style ConcatProjection + custom denoising loop. Restormer를 subprocess로 분리. tuning sweep (15 jobs) + LoRA fine-tuning sweep (5 configs, max_steps=50000) SLURM 스크립트 준비 완료. Restormer ckpt 다운로드 완료. natsort 설치 완료. **Smoke test 진행 중.**
+- **알려진 wire-up 이슈**: `SDEdit/run.yaml` 의 `test.num_images` 필드가 아직 SDEdit `run.py` 에 반영 안 됨 (OURS 쪽은 반영 완료)

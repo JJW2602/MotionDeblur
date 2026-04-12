@@ -30,6 +30,7 @@ DiffBIR/
 flow_grpo/
 etc/prior_aware/stage1/FFTformer/
 etc/prior_aware/stage1/Restormer/
+OURS/stage1/Restormer/
 
 # ===== Per-workspace experiment outputs =====
 SDEdit/result/

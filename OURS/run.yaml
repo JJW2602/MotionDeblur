@@ -1,44 +1,58 @@
-# OURS workspace — Stage1 (Restormer) + Stage2 (SD3.5 ControlNet)
+# OURS workspace — Stage1 (Restormer) + Stage2 (SD3.5 ControlNet, DiffBIR-style concat)
 mode: inference            # train | test | inference
-name: baseline_restormer_sd35  # experiment name → result/<name>/<mode>/
+name: baseline_restormer_sd35
 
-# Stage 1: Restormer
-restormer_ckpt: /scratch2/james2602/playground/Motionblur/etc/prior_aware/stage1/Restormer/Motion_Deblurring/pretrained_models/motion_deblurring.pth
+# ---------------------------------------------------------------------------
+# Stage 1: Restormer (via subprocess → demo.py)
+# ---------------------------------------------------------------------------
+stage1:
+  restormer_dir: /scratch2/james2602/playground/Motionblur/OURS/stage1/Restormer
+  task: Motion_Deblurring
+  tile: null               # null = full resolution; set e.g. 720 for large images
+  tile_overlap: 32
 
-# Stage 2: SD3.5 + Blur ControlNet
-base_model: stabilityai/stable-diffusion-3.5-large
-controlnet_model: stabilityai/stable-diffusion-3.5-large-controlnet-blur
-cpu_offload: true
+# ---------------------------------------------------------------------------
+# Stage 2: SD3.5 + Blur ControlNet (DiffBIR-style latent concat)
+# ---------------------------------------------------------------------------
+stage2:
+  base_model: stabilityai/stable-diffusion-3.5-large
+  controlnet_model: stabilityai/stable-diffusion-3.5-large-controlnet-blur
+  cpu_offload: true
 
-# Prompt
-prompt: "a sharp, clean, natural photo, no motion blur, high detail"
-negative_prompt: "motion blur, blurry, ghosting, smear, low quality, artifacts"
+  # Prompt
+  prompt: "a sharp, clean, natural photo, no motion blur, high detail"
+  negative_prompt: "motion blur, blurry, ghosting, smear, low quality, artifacts"
 
-# Generation
-guidance_scale: 4.0
-controlnet_scale: 0.8
-steps: 40
-seed: 42
+  # Generation
+  guidance_scale: 4.0
+  controlnet_scale: 0.8
+  steps: 40
+  seed: 42
+
+  # Checkpoints (null = zero-shot baseline)
+  lora_checkpoint: null            # trained LoRA .safetensors
+  concat_proj_checkpoint: null     # trained ConcatProjection .pt
 
 # Inference
 input: /scratch2/james2602/playground/Motionblur/dataset/gopro/blur/images/000007.png
 
-# LoRA checkpoint on the ControlNet (null = zero-shot baseline)
-checkpoint: null
-
 # Test
 test:
   save_images: false
+  smoke: false
+  num_images: null           # null = all test images; set e.g. 20 to limit
 
-# Train  (LoRA on ControlNet; Restormer + transformer frozen)
+# Train (LoRA on ControlNet + full params on ConcatProjection)
 train:
   max_train_steps: 10000
   save_every: 2000
   val_every: 500
   learning_rate: 1.0e-4
+  concat_proj_lr: 1.0e-3
   weight_decay: 0.0
   max_grad_norm: 1.0
   gradient_checkpointing: true
+  precompute_stage1: true
   rank: 8
   alpha: 8
   dropout: 0.0

@@ -1,33 +1,42 @@
-"""OURS workspace: Stage1 (Restormer) + Stage2 (SD3.5 ControlNet).
+"""OURS workspace: Stage1 (Restormer) + Stage2 (SD3.5 ControlNet, DiffBIR-style concat).
 
 Pipeline
 --------
-    blur ─► Restormer (frozen) ─► db_img ─► SD3.5 ControlNet(control=db_img) ─► out
+    blur -> [Stage1: Restormer subprocess] -> db_img
+                                                |
+                                           VAE encode -> prior_latent (16ch)
+                                                |
+    noise z --- cat(z, prior) -> ConcatProj(32->16) -> ControlNet --> block_samples
+      |                                                    ^               |
+      |                                          controlnet_cond=prior  (additive)
+      |                                                                    |
+      +-------------------------------------------> Transformer <----------+
+                                                        |
+                                                   noise_pred -> scheduler.step -> ...
 
 Modes
 -----
-- train:     LoRA fine-tuning on the ControlNet (Restormer + transformer frozen).
-             Control = Restormer(blur), target = sharp.
-- test:      run the full pipeline on the GoPro test split and log avg
-             PSNR/SSIM/LPIPS for blur / db_img / final out vs sharp GT.
-- inference: run on a single image, save [blur, db_img, out] grid.
+- inference: Stage1 on single image -> Stage2 -> save [blur, stage1, stage2] grid.
+- test:      Stage1 on test split + metrics -> Stage2 on all + metrics -> summary.
+- train:     Pre-compute Stage1 outputs -> LoRA on ControlNet + ConcatProjection.
 
-Results land in `OURS/result/<cfg.name>/<mode>/`.
+Results land in ``OURS/result/<cfg.name>/{stage1,stage2}/<mode>/``.
 """
 
 from __future__ import annotations
 
 import csv
-import importlib.util
 import json
 import os
+import subprocess
+import sys
 from collections import deque
 from pathlib import Path
 
 import hydra
 import numpy as np
 import torch
-import torch.nn.functional as F
+import torch.nn as nn
 from omegaconf import DictConfig, OmegaConf
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
@@ -35,22 +44,56 @@ from tqdm import tqdm
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
-RESTORMER_ARCH_PATH = (
-    PROJECT_ROOT / "etc" / "prior_aware" / "stage1" / "Restormer"
-    / "basicsr" / "models" / "archs" / "restormer_arch.py"
-)
+
+
+# ---------------------------------------------------------------------------
+# ConcatProjection — DiffBIR-style latent concat for ControlNet
+# ---------------------------------------------------------------------------
+class ConcatProjection(nn.Module):
+    """Project cat(noisy_z, prior_latent) from 2C to C channels.
+
+    Initialised as identity on first C channels (noise passthrough) and
+    zeros on the last C channels (prior).  At step 0 the output equals
+    the original noisy_z, so the pretrained ControlNet starts from its
+    normal behaviour.
+    """
+
+    def __init__(self, channels: int = 16):
+        super().__init__()
+        self.proj = nn.Conv2d(channels * 2, channels, kernel_size=1, bias=False)
+        self._init_weights(channels)
+
+    def _init_weights(self, channels: int) -> None:
+        with torch.no_grad():
+            nn.init.zeros_(self.proj.weight)  # [C, 2C, 1, 1]
+            for i in range(channels):
+                self.proj.weight[i, i, 0, 0] = 1.0
+
+    def forward(self, noisy_z: torch.Tensor, prior_latent: torch.Tensor) -> torch.Tensor:
+        return self.proj(torch.cat([noisy_z, prior_latent], dim=1))
 
 
 # ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------
 class GoProPairDataset(Dataset):
-    def __init__(self, blur_dir: str, sharp_dir: str, split_file: str, split: str, resolution: int):
+    """GoPro blur/sharp pair dataset with optional pre-computed Stage1 dir."""
+
+    def __init__(
+        self,
+        blur_dir: str,
+        sharp_dir: str,
+        split_file: str,
+        split: str,
+        resolution: int,
+        stage1_dir: str | None = None,
+    ):
         with open(split_file, "r") as f:
             self.filenames = json.load(f)[split]
         self.blur_dir = blur_dir
         self.sharp_dir = sharp_dir
         self.resolution = resolution
+        self.stage1_dir = stage1_dir
 
     def __len__(self) -> int:
         return len(self.filenames)
@@ -65,11 +108,16 @@ class GoProPairDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict:
         fname = self.filenames[idx]
-        return {
+        stem = Path(fname).stem
+        result = {
             "blur": self._load(os.path.join(self.blur_dir, fname)),
             "sharp": self._load(os.path.join(self.sharp_dir, fname)),
             "filename": fname,
         }
+        if self.stage1_dir is not None:
+            s1_path = os.path.join(self.stage1_dir, f"{stem}.png")
+            result["stage1"] = self._load(s1_path)
+        return result
 
 
 def pil_collate(batch):
@@ -103,14 +151,18 @@ class LpipsScorer:
     @torch.no_grad()
     def __call__(self, pred: np.ndarray, gt: np.ndarray) -> float:
         def to_t(a):
-            return (torch.from_numpy(a).float().permute(2, 0, 1).unsqueeze(0) / 127.5 - 1.0).to(self.device)
+            return (
+                torch.from_numpy(a).float().permute(2, 0, 1).unsqueeze(0) / 127.5 - 1.0
+            ).to(self.device)
 
         return float(self.model(to_t(pred), to_t(gt)).item())
 
 
 def snap_to_64(img: Image.Image) -> Image.Image:
     w, h = img.size
-    return img.resize((max(64, (w // 64) * 64), max(64, (h // 64) * 64)), Image.LANCZOS)
+    return img.resize(
+        (max(64, (w // 64) * 64), max(64, (h // 64) * 64)), Image.LANCZOS
+    )
 
 
 def make_grid(images: list[Image.Image]) -> Image.Image:
@@ -125,51 +177,6 @@ def make_grid(images: list[Image.Image]) -> Image.Image:
 
 
 # ---------------------------------------------------------------------------
-# Restormer (Stage1) — loaded standalone to avoid basicsr package conflicts
-# ---------------------------------------------------------------------------
-def _load_restormer_arch_module():
-    spec = importlib.util.spec_from_file_location("restormer_arch_standalone", RESTORMER_ARCH_PATH)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Cannot load Restormer arch from {RESTORMER_ARCH_PATH}")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
-def build_restormer(ckpt_path: str, device: str) -> torch.nn.Module:
-    arch = _load_restormer_arch_module()
-    model = arch.Restormer(
-        inp_channels=3, out_channels=3, dim=48,
-        num_blocks=[4, 6, 6, 8], num_refinement_blocks=4,
-        heads=[1, 2, 4, 8], ffn_expansion_factor=2.66,
-        bias=False, LayerNorm_type="WithBias", dual_pixel_task=False,
-    )
-    if not os.path.isfile(ckpt_path):
-        raise FileNotFoundError(
-            f"Restormer checkpoint not found: {ckpt_path}\n"
-            "Download motion_deblurring.pth from the Restormer release page."
-        )
-    ckpt = torch.load(ckpt_path, map_location="cpu")
-    model.load_state_dict(ckpt.get("params", ckpt), strict=True)
-    model.to(device).eval()
-    return model
-
-
-@torch.no_grad()
-def restormer_forward(model: torch.nn.Module, pil_img: Image.Image, device: str) -> Image.Image:
-    arr = np.asarray(pil_img.convert("RGB"), dtype=np.float32) / 255.0
-    t = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).to(device)
-    _, _, h, w = t.shape
-    pad_h = (8 - h % 8) % 8
-    pad_w = (8 - w % 8) % 8
-    if pad_h or pad_w:
-        t = F.pad(t, (0, pad_w, 0, pad_h), mode="reflect")
-    out = model(t)[..., :h, :w].clamp(0.0, 1.0)
-    out_np = (out[0].permute(1, 2, 0).cpu().numpy() * 255.0).round().astype(np.uint8)
-    return Image.fromarray(out_np)
-
-
-# ---------------------------------------------------------------------------
 # Workspace
 # ---------------------------------------------------------------------------
 class Workspace:
@@ -177,35 +184,119 @@ class Workspace:
         self.cfg = cfg
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.dtype = torch.float16 if self.device == "cuda" else torch.float32
-        self._restormer: torch.nn.Module | None = None
 
-    def _result_dir(self, mode: str) -> Path:
-        d = SCRIPT_DIR / "result" / self.cfg.name / mode
+    def _result_dir(self, *parts: str) -> Path:
+        d = SCRIPT_DIR / "result" / self.cfg.name
+        for p in parts:
+            d = d / p
         d.mkdir(parents=True, exist_ok=True)
         return d
 
-    def _get_restormer(self) -> torch.nn.Module:
-        if self._restormer is None:
-            self._restormer = build_restormer(self.cfg.restormer_ckpt, self.device)
-        return self._restormer
+    # ==================================================================
+    # Stage 1 — Restormer via subprocess
+    # ==================================================================
+    def run_stage1(self, input_dir: str, result_dir: str) -> Path:
+        """Run Restormer demo.py via subprocess.
 
-    # -- pipeline -----------------------------------------------------------
+        Returns the directory containing restored images
+        (demo.py saves to ``<result_dir>/<task>/``).
+        """
+        s1 = self.cfg.stage1
+        restormer_dir = str(s1.restormer_dir)
+        task = str(s1.task)
+
+        output_path = Path(result_dir) / task
+        if output_path.exists() and any(output_path.iterdir()):
+            print(f"[stage1] cached outputs found at {output_path}, skipping")
+            return output_path
+
+        cmd = [
+            sys.executable,
+            "demo.py",
+            "--task", task,
+            "--input_dir", str(input_dir),
+            "--result_dir", str(result_dir),
+        ]
+        if s1.get("tile") is not None:
+            cmd += ["--tile", str(s1.tile)]
+            cmd += ["--tile_overlap", str(s1.get("tile_overlap", 32))]
+
+        print(f"[stage1] running: {' '.join(cmd)}")
+        print(f"[stage1] cwd: {restormer_dir}")
+        subprocess.run(cmd, cwd=restormer_dir, check=True)
+        return output_path
+
+    def _compute_stage1_metrics(
+        self, stage1_img_dir: Path, filenames: list[str], out_dir: Path
+    ) -> dict:
+        """Compute PSNR/SSIM/LPIPS between Stage1 outputs and GT sharp images."""
+        lpips_scorer = LpipsScorer(self.device)
+        rows: list[dict] = []
+        grid_dir = out_dir / "grids"
+        grid_dir.mkdir(parents=True, exist_ok=True)
+
+        for fname in tqdm(filenames, desc="[stage1 metrics]"):
+            stem = Path(fname).stem
+            s1_path = stage1_img_dir / f"{stem}.png"
+            if not s1_path.exists():
+                print(f"[stage1 metrics] WARNING: missing {s1_path}")
+                continue
+            s1_img = Image.open(s1_path).convert("RGB")
+            sharp = Image.open(os.path.join(self.cfg.data.sharp_dir, fname)).convert("RGB")
+            blur = Image.open(os.path.join(self.cfg.data.blur_dir, fname)).convert("RGB")
+
+            target = sharp.size
+            gt_a = _to_uint8(sharp, target)
+            s1_a = _to_uint8(s1_img, target)
+            blur_a = _to_uint8(blur, target)
+
+            p_b, s_b = compute_psnr_ssim(blur_a, gt_a)
+            p_s1, s_s1 = compute_psnr_ssim(s1_a, gt_a)
+            rows.append({
+                "filename": fname,
+                "psnr_blur": p_b, "ssim_blur": s_b, "lpips_blur": lpips_scorer(blur_a, gt_a),
+                "psnr_stage1": p_s1, "ssim_stage1": s_s1, "lpips_stage1": lpips_scorer(s1_a, gt_a),
+            })
+
+            grid = make_grid([
+                Image.fromarray(blur_a),
+                Image.fromarray(s1_a),
+                Image.fromarray(gt_a),
+            ])
+            grid.save(grid_dir / f"{stem}.png")
+
+        agg = _aggregate(rows)
+        metrics = {"per_image": rows, "aggregate": agg, "n_images": len(rows)}
+        with open(out_dir / "metrics.json", "w") as f:
+            json.dump(metrics, f, indent=2)
+        print(
+            f"[stage1] psnr_stage1={agg['psnr_stage1']['mean']:.3f}  "
+            f"lpips_stage1={agg['lpips_stage1']['mean']:.4f}"
+        )
+        return agg
+
+    # ==================================================================
+    # Stage 2 — SD3.5 ControlNet with DiffBIR-style concat
+    # ==================================================================
     def _build_pipeline(self):
         from diffusers import SD3ControlNetModel, StableDiffusion3ControlNetPipeline
 
-        controlnet = SD3ControlNetModel.from_pretrained(self.cfg.controlnet_model, torch_dtype=self.dtype)
+        s2 = self.cfg.stage2
+        controlnet = SD3ControlNetModel.from_pretrained(
+            s2.controlnet_model, torch_dtype=self.dtype,
+        )
         pipe = StableDiffusion3ControlNetPipeline.from_pretrained(
-            self.cfg.base_model, controlnet=controlnet, torch_dtype=self.dtype,
+            s2.base_model, controlnet=controlnet, torch_dtype=self.dtype,
         )
         pipe.set_progress_bar_config(disable=True)
-        if self.cfg.get("cpu_offload", True):
+        if s2.get("cpu_offload", True):
             pipe.enable_model_cpu_offload()
         else:
             pipe.to(self.device)
         return pipe, controlnet
 
-    def _load_lora(self, pipe, controlnet) -> None:
-        ckpt = self.cfg.get("checkpoint")
+    def _load_lora(self, controlnet) -> None:
+        ckpt = self.cfg.stage2.get("lora_checkpoint")
         if ckpt is None:
             return
         ckpt = str(ckpt)
@@ -216,12 +307,25 @@ class Workspace:
         controlnet.load_state_dict(load_file(ckpt), strict=False)
         print(f"[ckpt] loaded ControlNet LoRA -> {ckpt}")
 
+    def _build_concat_proj(self) -> ConcatProjection:
+        proj = ConcatProjection(channels=16)
+        ckpt = self.cfg.stage2.get("concat_proj_checkpoint")
+        if ckpt is not None:
+            ckpt = str(ckpt)
+            if not os.path.isfile(ckpt):
+                raise FileNotFoundError(f"ConcatProjection checkpoint not found: {ckpt}")
+            proj.load_state_dict(torch.load(ckpt, map_location="cpu"))
+            print(f"[ckpt] loaded ConcatProjection -> {ckpt}")
+        proj.to(self.device, dtype=self.dtype)
+        return proj
+
     def _encode_prompt(self, pipe):
+        s2 = self.cfg.stage2
         pe, _, pp, _ = pipe.encode_prompt(
-            prompt=self.cfg.prompt,
-            prompt_2=self.cfg.get("prompt_2"),
-            prompt_3=self.cfg.get("prompt_3"),
-            negative_prompt=self.cfg.negative_prompt,
+            prompt=s2.prompt,
+            prompt_2=s2.get("prompt_2"),
+            prompt_3=s2.get("prompt_3"),
+            negative_prompt=s2.negative_prompt,
             device=self.device,
             num_images_per_prompt=1,
             do_classifier_free_guidance=False,
@@ -229,119 +333,247 @@ class Workspace:
         return pe, pp
 
     def _encode_image(self, pipe, img: Image.Image) -> torch.Tensor:
-        from diffusers.pipelines.stable_diffusion_3.pipeline_stable_diffusion_3_img2img import retrieve_latents
+        from diffusers.pipelines.stable_diffusion_3.pipeline_stable_diffusion_3_img2img import (
+            retrieve_latents,
+        )
 
-        t = pipe.image_processor.preprocess(img).to(device=self.device, dtype=pipe.vae.dtype)
+        t = pipe.image_processor.preprocess(img).to(
+            device=self.device, dtype=pipe.vae.dtype,
+        )
         latents = retrieve_latents(pipe.vae.encode(t))
         return (latents - pipe.vae.config.shift_factor) * pipe.vae.config.scaling_factor
 
-    def _generate(self, pipe, control_image: Image.Image, height: int, width: int, seed: int) -> Image.Image:
+    @torch.no_grad()
+    def _generate(
+        self,
+        pipe,
+        controlnet,
+        concat_proj: ConcatProjection,
+        stage1_img: Image.Image,
+        height: int,
+        width: int,
+        seed: int,
+    ) -> Image.Image:
+        """Custom denoising loop with DiffBIR-style concat conditioning."""
+        s2 = self.cfg.stage2
         g = torch.Generator(device=self.device).manual_seed(seed)
-        return pipe(
-            prompt=self.cfg.prompt,
-            negative_prompt=self.cfg.negative_prompt,
-            control_image=control_image,
-            height=height, width=width,
-            num_inference_steps=int(self.cfg.steps),
-            guidance_scale=float(self.cfg.guidance_scale),
-            controlnet_conditioning_scale=float(self.cfg.controlnet_scale),
-            generator=g,
-        ).images[0]
 
-    # ========================================================================
-    # INFERENCE
-    # ========================================================================
-    def inference(self) -> None:
-        out_dir = self._result_dir("inference")
-        blur = snap_to_64(Image.open(self.cfg.input).convert("RGB"))
+        # Encode Stage1 output -> prior latent
+        prior_latent = self._encode_image(pipe, stage1_img)
 
-        restormer = self._get_restormer()
-        db_img = restormer_forward(restormer, blur, self.device)
+        # Encode prompt
+        prompt_embeds, pooled_prompt_embeds = self._encode_prompt(pipe)
 
-        pipe, controlnet = self._build_pipeline()
-        self._load_lora(pipe, controlnet)
-        W, H = blur.size
-        out = self._generate(pipe, db_img, H, W, self.cfg.seed)
-
-        grid = make_grid([blur, db_img, out])
-        stem = Path(self.cfg.input).stem
-        grid.save(out_dir / f"{stem}_grid.png")
-        out.save(out_dir / f"{stem}_out.png")
-        db_img.save(out_dir / f"{stem}_stage1.png")
-        print(f"[inference] grid -> {out_dir / f'{stem}_grid.png'}")
-
-    # ========================================================================
-    # TEST
-    # ========================================================================
-    def test(self) -> None:
-        out_dir = self._result_dir("test")
-        dataset = GoProPairDataset(
-            self.cfg.data.blur_dir, self.cfg.data.sharp_dir,
-            self.cfg.data.split_file, "test", self.cfg.data.resolution,
+        # Prepare noise latents
+        num_channels = pipe.transformer.config.in_channels
+        latents = pipe.prepare_latents(
+            1, num_channels, height, width,
+            prompt_embeds.dtype, self.device, g,
         )
-        if bool(self.cfg.get("smoke", False)):
-            dataset.filenames = dataset.filenames[:5]
-        print(f"[test] n_images={len(dataset)}")
 
-        restormer = self._get_restormer()
+        # Timesteps
+        from diffusers.pipelines.stable_diffusion_3.pipeline_stable_diffusion_3 import (
+            retrieve_timesteps,
+        )
+
+        steps = int(s2.steps)
+        timesteps, num_inference_steps = retrieve_timesteps(pipe.scheduler, steps, self.device)
+
+        # ControlNet config
+        cn_config = controlnet.config
+        if getattr(cn_config, "force_zeros_for_pooled_projection", True):
+            cn_pooled = torch.zeros_like(pooled_prompt_embeds)
+        else:
+            cn_pooled = pooled_prompt_embeds
+        if getattr(cn_config, "joint_attention_dim", None) is not None:
+            cn_encoder_hidden = prompt_embeds
+        else:
+            cn_encoder_hidden = None
+
+        cond_scale = float(s2.controlnet_scale)
+
+        # Denoising loop
+        for t in tqdm(timesteps, desc="[stage2 denoise]"):
+            timestep = t.expand(latents.shape[0])
+
+            # DiffBIR concat: project cat(noisy_z, prior) -> 16ch for ControlNet
+            cn_hidden = concat_proj(latents, prior_latent)
+
+            # ControlNet: double conditioning (concat path + additive controlnet_cond)
+            control_block_samples = controlnet(
+                hidden_states=cn_hidden,
+                controlnet_cond=prior_latent,
+                conditioning_scale=cond_scale,
+                timestep=timestep,
+                encoder_hidden_states=cn_encoder_hidden,
+                pooled_projections=cn_pooled,
+                return_dict=False,
+            )[0]
+
+            # Transformer: sees original noisy z + control signals
+            noise_pred = pipe.transformer(
+                hidden_states=latents,
+                timestep=timestep,
+                encoder_hidden_states=prompt_embeds,
+                pooled_projections=pooled_prompt_embeds,
+                block_controlnet_hidden_states=control_block_samples,
+                return_dict=False,
+            )[0]
+
+            latents = pipe.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+
+        # VAE decode
+        latents = (latents / pipe.vae.config.scaling_factor) + pipe.vae.config.shift_factor
+        image = pipe.vae.decode(latents, return_dict=False)[0]
+        image = pipe.image_processor.postprocess(image, output_type="pil")[0]
+        return image
+
+    # ==================================================================
+    # INFERENCE
+    # ==================================================================
+    def inference(self) -> None:
+        input_path = self.cfg.input
+        stem = Path(input_path).stem
+
+        # --- Stage 1 ---
+        s1_result_dir = self._result_dir("stage1")
+        s1_img_dir = self.run_stage1(input_path, str(s1_result_dir))
+        s1_img = Image.open(s1_img_dir / f"{stem}.png").convert("RGB")
+
+        # Stage 1 grid: [blur, stage1]
+        blur_orig = Image.open(input_path).convert("RGB")
+        s1_grid_dir = s1_result_dir / "grids"
+        s1_grid_dir.mkdir(parents=True, exist_ok=True)
+        s1_grid = make_grid([blur_orig, s1_img])
+        s1_grid.save(s1_grid_dir / f"{stem}.png")
+        print(f"[stage1] grid -> {s1_grid_dir / f'{stem}.png'}")
+
+        # --- Stage 2 ---
+        s2_out = self._result_dir("stage2", "inference")
+        blur = snap_to_64(Image.open(input_path).convert("RGB"))
+        s1_img_resized = snap_to_64(s1_img)
+        W, H = s1_img_resized.size
+
         pipe, controlnet = self._build_pipeline()
-        self._load_lora(pipe, controlnet)
+        self._load_lora(controlnet)
+        concat_proj = self._build_concat_proj()
+        concat_proj.eval()
+
+        out = self._generate(pipe, controlnet, concat_proj, s1_img_resized, H, W, self.cfg.stage2.seed)
+
+        grid = make_grid([blur, s1_img_resized, out])
+        grid.save(s2_out / f"{stem}_grid.png")
+        out.save(s2_out / f"{stem}_out.png")
+        s1_img.save(s2_out / f"{stem}_stage1.png")
+        print(f"[inference] grid -> {s2_out / f'{stem}_grid.png'}")
+
+    # ==================================================================
+    # TEST
+    # ==================================================================
+    def test(self) -> None:
+        dataset = GoProPairDataset(
+            self.cfg.data.blur_dir,
+            self.cfg.data.sharp_dir,
+            self.cfg.data.split_file,
+            "test",
+            self.cfg.data.resolution,
+        )
+        if bool(self.cfg.test.get("smoke", False)):
+            dataset.filenames = dataset.filenames[:5]
+        num_images = self.cfg.test.get("num_images")
+        if num_images is not None:
+            dataset.filenames = dataset.filenames[:int(num_images)]
+        filenames = list(dataset.filenames)
+        print(f"[test] n_images={len(filenames)}")
+
+        # --- Stage 1 ---
+        s1_result_dir = self._result_dir("stage1")
+        s1_img_dir = self.run_stage1(self.cfg.data.blur_dir, str(s1_result_dir))
+        self._compute_stage1_metrics(s1_img_dir, filenames, s1_result_dir)
+
+        # --- Stage 2 ---
+        s2_out = self._result_dir("stage2", "test")
+        pipe, controlnet = self._build_pipeline()
+        self._load_lora(controlnet)
+        concat_proj = self._build_concat_proj()
+        concat_proj.eval()
         lpips_scorer = LpipsScorer(self.device)
 
         rows: list[dict] = []
-        for i in tqdm(range(len(dataset)), desc="[test]"):
+        for i in tqdm(range(len(filenames)), desc="[stage2 test]"):
             sample = dataset[i]
+            fname = sample["filename"]
+            stem = Path(fname).stem
             blur = sample["blur"]
             sharp = sample["sharp"]
 
-            db_img = restormer_forward(restormer, blur, self.device)
-            W, H = blur.size
-            out_img = self._generate(pipe, db_img, H, W, self.cfg.seed)
+            s1_path = s1_img_dir / f"{stem}.png"
+            s1_img = snap_to_64(Image.open(s1_path).convert("RGB"))
+            W, H = s1_img.size
+
+            out_img = self._generate(
+                pipe, controlnet, concat_proj, s1_img, H, W, self.cfg.stage2.seed,
+            )
 
             target = sharp.size
             gt_a = _to_uint8(sharp, target)
             blur_a = _to_uint8(blur, target)
-            db_a = _to_uint8(db_img, target)
+            s1_a = _to_uint8(s1_img, target)
             out_a = _to_uint8(out_img, target)
 
             p_b, s_b = compute_psnr_ssim(blur_a, gt_a)
-            p_d, s_d = compute_psnr_ssim(db_a, gt_a)
+            p_s1, s_s1 = compute_psnr_ssim(s1_a, gt_a)
             p_o, s_o = compute_psnr_ssim(out_a, gt_a)
             rows.append({
-                "filename": sample["filename"],
-                "psnr_blur": p_b, "ssim_blur": s_b, "lpips_blur": lpips_scorer(blur_a, gt_a),
-                "psnr_db": p_d, "ssim_db": s_d, "lpips_db": lpips_scorer(db_a, gt_a),
-                "psnr_out": p_o, "ssim_out": s_o, "lpips_out": lpips_scorer(out_a, gt_a),
+                "filename": fname,
+                "psnr_blur": p_b, "ssim_blur": s_b,
+                "lpips_blur": lpips_scorer(blur_a, gt_a),
+                "psnr_stage1": p_s1, "ssim_stage1": s_s1,
+                "lpips_stage1": lpips_scorer(s1_a, gt_a),
+                "psnr_out": p_o, "ssim_out": s_o,
+                "lpips_out": lpips_scorer(out_a, gt_a),
             })
 
             if bool(self.cfg.test.get("save_images", False)):
-                stem = Path(sample["filename"]).stem
-                sub = out_dir / "images" / stem
+                sub = s2_out / "images" / stem
                 sub.mkdir(parents=True, exist_ok=True)
                 Image.fromarray(blur_a).save(sub / "blur.png")
-                Image.fromarray(db_a).save(sub / "db.png")
+                Image.fromarray(s1_a).save(sub / "stage1.png")
                 Image.fromarray(out_a).save(sub / "out.png")
                 Image.fromarray(gt_a).save(sub / "gt.png")
 
-            if (i + 1) % 10 == 0 or (i + 1) == len(dataset):
-                _dump_csv(rows, out_dir / "per_image.csv")
+            if (i + 1) % 10 == 0 or (i + 1) == len(filenames):
+                _dump_csv(rows, s2_out / "per_image.csv")
 
         agg = _aggregate(rows)
-        with open(out_dir / "summary.json", "w") as f:
-            json.dump({"config": {
-                "restormer_ckpt": str(self.cfg.restormer_ckpt),
-                "controlnet_model": self.cfg.controlnet_model,
-                "guidance_scale": self.cfg.guidance_scale,
-                "controlnet_scale": self.cfg.controlnet_scale,
-                "steps": self.cfg.steps,
-            }, "metrics": agg, "n_images": len(rows)}, f, indent=2)
-        print(f"[test] psnr_db={agg['psnr_db']['mean']:.3f}  psnr_out={agg['psnr_out']['mean']:.3f}  "
-              f"lpips_out={agg['lpips_out']['mean']:.4f}")
-        print(f"[test] summary -> {out_dir / 'summary.json'}")
+        s2_cfg = self.cfg.stage2
+        with open(s2_out / "summary.json", "w") as f:
+            json.dump(
+                {
+                    "config": {
+                        "controlnet_model": s2_cfg.controlnet_model,
+                        "guidance_scale": s2_cfg.guidance_scale,
+                        "controlnet_scale": s2_cfg.controlnet_scale,
+                        "steps": s2_cfg.steps,
+                        "lora_checkpoint": str(s2_cfg.get("lora_checkpoint")),
+                        "concat_proj_checkpoint": str(s2_cfg.get("concat_proj_checkpoint")),
+                    },
+                    "metrics": agg,
+                    "n_images": len(rows),
+                },
+                f,
+                indent=2,
+            )
+        print(
+            f"[test] psnr_stage1={agg['psnr_stage1']['mean']:.3f}  "
+            f"psnr_out={agg['psnr_out']['mean']:.3f}  "
+            f"lpips_out={agg['lpips_out']['mean']:.4f}"
+        )
+        print(f"[test] summary -> {s2_out / 'summary.json'}")
 
-    # ========================================================================
-    # TRAIN  (LoRA on ControlNet; Restormer + transformer frozen)
-    # ========================================================================
+    # ==================================================================
+    # TRAIN (LoRA on ControlNet + full params on ConcatProjection)
+    # ==================================================================
     def train(self) -> None:
         from diffusers.training_utils import (
             cast_training_params,
@@ -352,10 +584,18 @@ class Workspace:
         from peft.utils import get_peft_model_state_dict
         from safetensors.torch import save_file
 
-        out_dir = self._result_dir("train")
         tcfg = self.cfg.train
+        s2_out = self._result_dir("stage2", "train")
 
-        restormer = self._get_restormer()
+        # --- Pre-compute Stage 1 outputs ---
+        stage1_dir: str | None = None
+        if bool(tcfg.get("precompute_stage1", True)):
+            s1_result_dir = self._result_dir("stage1")
+            s1_img_dir = self.run_stage1(self.cfg.data.blur_dir, str(s1_result_dir))
+            stage1_dir = str(s1_img_dir)
+            print(f"[train] stage1 precomputed -> {stage1_dir}")
+
+        # --- Build pipeline ---
         pipe, controlnet = self._build_pipeline()
         pipe.vae.requires_grad_(False)
         pipe.transformer.requires_grad_(False)
@@ -367,8 +607,11 @@ class Workspace:
         if tcfg.gradient_checkpointing:
             controlnet.enable_gradient_checkpointing()
 
+        # LoRA on ControlNet
         lora_cfg = LoraConfig(
-            r=tcfg.rank, lora_alpha=tcfg.alpha, lora_dropout=tcfg.dropout,
+            r=tcfg.rank,
+            lora_alpha=tcfg.alpha,
+            lora_dropout=tcfg.dropout,
             target_modules=list(tcfg.target_modules),
         )
         controlnet.add_adapter(lora_cfg)
@@ -376,48 +619,112 @@ class Workspace:
         controlnet.train()
         pipe.transformer.eval()
 
+        # ConcatProjection (full params, float32)
+        concat_proj = ConcatProjection(channels=16).to(self.device, dtype=torch.float32)
+        concat_proj.train()
+
+        # Optimizer with two param groups
+        cn_params = [p for p in controlnet.parameters() if p.requires_grad]
+        cp_params = list(concat_proj.parameters())
         optimizer = torch.optim.AdamW(
-            [p for p in controlnet.parameters() if p.requires_grad],
-            lr=tcfg.learning_rate, weight_decay=tcfg.weight_decay,
+            [
+                {"params": cn_params, "lr": tcfg.learning_rate},
+                {"params": cp_params, "lr": tcfg.get("concat_proj_lr", 1e-3)},
+            ],
+            weight_decay=tcfg.weight_decay,
         )
 
+        # Prompt embeddings (cached)
         with torch.no_grad():
             prompt_embeds, pooled_embeds = self._encode_prompt(pipe)
 
+        # ControlNet pooled projections
+        cn_config = controlnet.config
+        if getattr(cn_config, "force_zeros_for_pooled_projection", True):
+            cn_pooled = torch.zeros_like(pooled_embeds)
+        else:
+            cn_pooled = pooled_embeds
+        if getattr(cn_config, "joint_attention_dim", None) is not None:
+            cn_encoder_hidden = prompt_embeds
+        else:
+            cn_encoder_hidden = None
+
+        # Datasets
         train_ds = GoProPairDataset(
-            self.cfg.data.blur_dir, self.cfg.data.sharp_dir,
-            self.cfg.data.split_file, "train", self.cfg.data.resolution,
+            self.cfg.data.blur_dir,
+            self.cfg.data.sharp_dir,
+            self.cfg.data.split_file,
+            "train",
+            self.cfg.data.resolution,
+            stage1_dir=stage1_dir,
         )
         val_ds = GoProPairDataset(
-            self.cfg.data.blur_dir, self.cfg.data.sharp_dir,
-            self.cfg.data.split_file, "test", self.cfg.data.resolution,
+            self.cfg.data.blur_dir,
+            self.cfg.data.sharp_dir,
+            self.cfg.data.split_file,
+            "test",
+            self.cfg.data.resolution,
+            stage1_dir=stage1_dir,
         )
-        train_dl = DataLoader(train_ds, batch_size=1, shuffle=True,
-                              num_workers=self.cfg.data.num_workers,
-                              drop_last=True, collate_fn=pil_collate)
-        val_dl = DataLoader(val_ds, batch_size=1, shuffle=False,
-                            num_workers=self.cfg.data.num_workers,
-                            drop_last=False, collate_fn=pil_collate)
+        train_dl = DataLoader(
+            train_ds,
+            batch_size=1,
+            shuffle=True,
+            num_workers=self.cfg.data.num_workers,
+            drop_last=True,
+            collate_fn=pil_collate,
+        )
+        val_dl = DataLoader(
+            val_ds,
+            batch_size=1,
+            shuffle=False,
+            num_workers=self.cfg.data.num_workers,
+            drop_last=False,
+            collate_fn=pil_collate,
+        )
 
         scheduler = pipe.scheduler
         num_train_ts = scheduler.config.num_train_timesteps
-        generator = torch.Generator(device=self.device).manual_seed(self.cfg.seed)
+        generator = torch.Generator(device=self.device).manual_seed(self.cfg.stage2.seed)
+
+        # Param counts for logging
+        n_lora = sum(p.numel() for p in cn_params)
+        n_cp = sum(p.numel() for p in cp_params)
+        n_total = n_lora + n_cp
+        print(f"[train] trainable params: lora={n_lora:,}  concat_proj={n_cp:,}  total={n_total:,}")
+        print(f"[train] params/image ratio: {n_total / len(train_ds):.1f}")
 
         use_wandb = bool(self.cfg.use_wandb)
         if use_wandb:
             import wandb
-            wandb.init(project=self.cfg.wandb_project, entity=self.cfg.get("wandb_entity"),
-                       name=f"OURS_{self.cfg.name}",
-                       config=OmegaConf.to_container(self.cfg, resolve=True))
 
-        def one_step(blur: Image.Image, sharp: Image.Image):
+            wandb.init(
+                project=self.cfg.wandb_project,
+                entity=self.cfg.get("wandb_entity"),
+                name=f"OURS_{self.cfg.name}",
+                config={
+                    **OmegaConf.to_container(self.cfg, resolve=True),
+                    "trainable_params": {
+                        "lora": n_lora,
+                        "concat_proj": n_cp,
+                        "total": n_total,
+                        "params_per_image": round(n_total / len(train_ds), 1),
+                    },
+                },
+            )
+
+        def one_step(blur_img: Image.Image, sharp_img: Image.Image, s1_img: Image.Image):
             with torch.no_grad():
-                db_img = restormer_forward(restormer, blur, self.device)
-                target_lat = self._encode_image(pipe, sharp)
-            noise = torch.randn(target_lat.shape, generator=generator, device=self.device, dtype=self.dtype)
+                target_lat = self._encode_image(pipe, sharp_img)
+                prior_lat = self._encode_image(pipe, s1_img)
+            noise = torch.randn(
+                target_lat.shape, generator=generator, device=self.device, dtype=self.dtype,
+            )
             u = compute_density_for_timestep_sampling(
-                weighting_scheme=tcfg.weighting_scheme, batch_size=1,
-                device=self.device, generator=generator,
+                weighting_scheme=tcfg.weighting_scheme,
+                batch_size=1,
+                device=self.device,
+                generator=generator,
             )
             idx = (u * num_train_ts).long().clamp(max=num_train_ts - 1).cpu()
             ts = scheduler.timesteps[idx].to(self.device)
@@ -425,51 +732,76 @@ class Workspace:
             noisy = scheduler.scale_noise(target_lat, ts, noise)
             target = noise - target_lat
 
-            control_t = pipe.image_processor.preprocess(db_img).to(device=self.device, dtype=self.dtype)
+            # DiffBIR concat projection
+            cn_hidden = concat_proj(noisy, prior_lat)
+
+            # ControlNet with double conditioning
             cn_out = controlnet(
-                hidden_states=noisy, timestep=ts,
-                encoder_hidden_states=prompt_embeds,
-                pooled_projections=pooled_embeds,
-                controlnet_cond=control_t, return_dict=False,
+                hidden_states=cn_hidden,
+                controlnet_cond=prior_lat,
+                timestep=ts,
+                encoder_hidden_states=cn_encoder_hidden,
+                pooled_projections=cn_pooled,
+                return_dict=False,
             )
+
+            # Transformer sees original noisy latent
             pred = pipe.transformer(
-                hidden_states=noisy, timestep=ts,
+                hidden_states=noisy,
+                timestep=ts,
                 encoder_hidden_states=prompt_embeds,
                 pooled_projections=pooled_embeds,
                 block_controlnet_hidden_states=cn_out[0],
                 return_dict=False,
             )[0]
-            w = compute_loss_weighting_for_sd3(tcfg.weighting_scheme, sigmas=sigmas).view(-1, 1, 1, 1)
+            w = compute_loss_weighting_for_sd3(
+                tcfg.weighting_scheme, sigmas=sigmas,
+            ).view(-1, 1, 1, 1)
             return (w * (pred.float() - target.float()).pow(2)).mean()
 
         @torch.no_grad()
         def validate() -> float:
             controlnet.eval()
+            concat_proj.eval()
             losses = []
             for b in val_dl:
-                losses.append(one_step(b["blur"][0], b["sharp"][0]).item())
+                losses.append(
+                    one_step(b["blur"][0], b["sharp"][0], b["stage1"][0]).item()
+                )
             controlnet.train()
+            concat_proj.train()
             return float(np.mean(losses)) if losses else float("nan")
 
         def save_ckpt(label):
+            # LoRA
             sd = get_peft_model_state_dict(controlnet)
-            name = f"ours_lora_step{label}.safetensors"
-            save_file(sd, str(out_dir / name))
-            print(f"[ckpt] -> {out_dir / name}")
+            lora_name = f"ours_lora_step{label}.safetensors"
+            save_file(sd, str(s2_out / lora_name))
+            # ConcatProjection
+            cp_name = f"ours_concat_proj_step{label}.pt"
+            torch.save(concat_proj.state_dict(), str(s2_out / cp_name))
+            print(f"[ckpt] -> {s2_out / lora_name}, {s2_out / cp_name}")
 
         max_steps = tcfg.max_train_steps
-        print(f"[train] dataset={len(train_ds)}  val={len(val_ds)}  max_steps={max_steps}")
+        steps_per_epoch = len(train_dl)
+        print(
+            f"[train] dataset={len(train_ds)}  val={len(val_ds)}  "
+            f"max_steps={max_steps}  steps_per_epoch={steps_per_epoch}"
+        )
         global_step = 0
-        window = deque(maxlen=100)
+        epoch = 0
+        best_val_loss = float("inf")
+        window: deque = deque(maxlen=100)
         pbar = tqdm(total=max_steps, desc="[train]", unit="step")
         done = False
         while not done:
+            epoch += 1
             for batch in train_dl:
                 global_step += 1
-                loss = one_step(batch["blur"][0], batch["sharp"][0])
+                loss = one_step(batch["blur"][0], batch["sharp"][0], batch["stage1"][0])
                 loss.backward()
                 grad = torch.nn.utils.clip_grad_norm_(
-                    [p for p in controlnet.parameters() if p.requires_grad], tcfg.max_grad_norm,
+                    cn_params + cp_params, tcfg.max_grad_norm,
                 )
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -480,16 +812,42 @@ class Workspace:
                 pbar.set_postfix(loss=f"{lv:.5f}", avg=f"{np.mean(window):.5f}")
 
                 if use_wandb:
-                    wandb.log({"loss/raw": lv, "loss/window_avg_100": float(np.mean(window)),
-                               "optim/lr": optimizer.param_groups[0]["lr"],
-                               "optim/grad_norm": grad.item() if torch.is_tensor(grad) else float(grad)},
-                              step=global_step)
+                    import wandb
+
+                    wandb.log(
+                        {
+                            "loss/raw": lv,
+                            "loss/window_avg_100": float(np.mean(window)),
+                            "train/epoch": epoch,
+                            "train/epoch_frac": global_step / steps_per_epoch,
+                            "optim/lr_cn": optimizer.param_groups[0]["lr"],
+                            "optim/lr_cp": optimizer.param_groups[1]["lr"],
+                            "optim/grad_norm": (
+                                grad.item() if torch.is_tensor(grad) else float(grad)
+                            ),
+                        },
+                        step=global_step,
+                    )
 
                 if global_step % tcfg.val_every == 0:
                     vl = validate()
-                    print(f"[val] step={global_step} val_loss={vl:.5f}")
+                    is_best = vl < best_val_loss
+                    if is_best:
+                        best_val_loss = vl
+                        save_ckpt("best")
+                    print(
+                        f"[val] step={global_step} epoch={epoch} "
+                        f"val_loss={vl:.5f} best={best_val_loss:.5f}"
+                        f"{' *' if is_best else ''}"
+                    )
                     if use_wandb:
-                        wandb.log({"val/loss": vl}, step=global_step)
+                        wandb.log(
+                            {
+                                "val/loss": vl,
+                                "val/best_loss": best_val_loss,
+                            },
+                            step=global_step,
+                        )
                 if global_step % tcfg.save_every == 0:
                     save_ckpt(global_step)
                 if global_step >= max_steps:
@@ -501,6 +859,8 @@ class Workspace:
             wandb.finish()
 
 
+# ---------------------------------------------------------------------------
+# Helpers
 # ---------------------------------------------------------------------------
 def _dump_csv(rows: list[dict], path: Path) -> None:
     if not rows:
@@ -522,12 +882,17 @@ def _aggregate(rows: list[dict]) -> dict:
     for k in keys:
         vals = np.array([r[k] for r in rows], dtype=np.float64)
         vals = vals[np.isfinite(vals)]
-        out[k] = {"mean": float(vals.mean()) if len(vals) else float("nan"),
-                  "std": float(vals.std()) if len(vals) else float("nan"),
-                  "n": int(len(vals))}
+        out[k] = {
+            "mean": float(vals.mean()) if len(vals) else float("nan"),
+            "std": float(vals.std()) if len(vals) else float("nan"),
+            "n": int(len(vals)),
+        }
     return out
 
 
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 @hydra.main(version_base=None, config_path=".", config_name="run")
 def main(cfg: DictConfig) -> None:
     print(OmegaConf.to_yaml(cfg))
